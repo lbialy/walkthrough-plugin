@@ -1,0 +1,15 @@
+<idea-plugin>
+    <dependencies>
+        <module name="intellij.platform.backend"/>
+        <module name="intellij.platform.kernel.backend"/>
+        <plugin id="Git4Idea"/>
+        <module name="walkthrough.shared"/>
+    </dependencies>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <projectService serviceImplementation="com.forketyfork.walkthrough.WalkthroughHistoryService"/>
+        <platform.rpc.backend.remoteApiProvider
+                implementation="com.forketyfork.walkthrough.WalkthroughBackendRpcApiProvider"/>
+        <postStartupActivity implementation="com.forketyfork.walkthrough.WalkthroughBackendStartupActivity"/>
+    </extensions>
+</idea-plugin>

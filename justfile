@@ -12,6 +12,10 @@ build:
 run:
     ./gradlew runIde
 
+# Run the plugin in Split Mode: a sandboxed IDE backend plus a JetBrains Client connected to it
+run-split:
+    ./gradlew runIdeSplitMode
+
 # Verify the plugin (compatibility checks)
 verify:
     ./gradlew verifyPlugin

@@ -1,16 +1,22 @@
 import dev.detekt.gradle.Detekt
-import dev.detekt.gradle.DetektCreateBaselineTask
+import dev.detekt.gradle.extensions.DetektExtension
+import org.jetbrains.intellij.platform.gradle.tasks.ComposedJarTask
+import org.jetbrains.intellij.platform.gradle.tasks.RunIdeTask
+import org.jetbrains.intellij.platform.gradle.tasks.aware.SplitModeAware
 
 plugins {
-    id("java")
-    id("org.jetbrains.kotlin.jvm") version "2.4.20"
-    id("org.jetbrains.intellij.platform") version "2.19.0"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.4.20"
-    alias(libs.plugins.detekt)
+    id("org.jetbrains.intellij.platform")
+    id("org.jetbrains.kotlin.jvm")
+    id("rpc") apply false
+    id("org.jetbrains.kotlin.plugin.serialization") apply false
+    id("org.jetbrains.kotlin.plugin.compose") apply false
+    id("dev.detekt") apply false
 }
 
 group = "com.forketyfork"
 version = providers.gradleProperty("pluginVersion").get()
+
+val intellijPlatformVersion = providers.gradleProperty("intellijPlatformVersion").get()
 
 fun latestChangelog(): String {
     val changelog = file("CHANGELOG.md")
@@ -23,46 +29,85 @@ fun latestChangelog(): String {
     return section.joinToString("\n").trim().ifEmpty { "Initial version" }
 }
 
-repositories {
-    mavenCentral()
-    intellijPlatform {
-        defaultRepositories()
+subprojects {
+    apply(plugin = "org.jetbrains.intellij.platform.module")
+    apply(plugin = "rpc")
+    apply(plugin = "org.jetbrains.kotlin.jvm")
+    apply(plugin = "org.jetbrains.kotlin.plugin.serialization")
+    apply(plugin = "dev.detekt")
+
+    group = rootProject.group
+    version = rootProject.version
+
+    // The platform loads content module `walkthrough.<x>` from `lib/modules/walkthrough.<x>.jar`,
+    // so each composed module jar must be named after its descriptor (e.g. backend-mcp -> walkthrough.backend.mcp).
+    tasks.withType<ComposedJarTask>().configureEach {
+        archiveFileName.set("walkthrough.${project.name.replace('-', '.')}.jar")
+    }
+
+    val libs = rootProject.extensions.getByType<VersionCatalogsExtension>().named("libs")
+
+    dependencies {
+        "compileOnly"(libs.findLibrary("kotlinx-serialization-core-jvm").get())
+        "compileOnly"(libs.findLibrary("kotlinx-serialization-json-jvm").get())
+
+        "testImplementation"(libs.findLibrary("junit-jupiter").get())
+        "testImplementation"(libs.findLibrary("opentest4j").get())
+        "testRuntimeOnly"(libs.findLibrary("junit-platform-launcher").get())
+        "testRuntimeOnly"(libs.findLibrary("junit4").get())
+
+        "detektPlugins"(libs.findLibrary("detekt-rules-ktlint-wrapper").get())
+        "detektPlugins"(libs.findLibrary("detekt-compose-rules").get())
+    }
+
+    tasks.withType<Test>().configureEach {
+        useJUnitPlatform()
+    }
+
+    // The JVM target follows the IntelliJ Platform (Java 25 for 2026.2); IPGP configures it.
+
+    extensions.configure<DetektExtension> {
+        source.setFrom("src/main/kotlin", "src/test/kotlin")
+        parallel = true
+        config.setFrom(rootProject.files("detekt.yml"))
+        buildUponDefaultConfig = true
+        basePath.set(projectDir)
+    }
+
+    tasks.withType<Detekt>().configureEach {
+        reports {
+            sarif.required.set(true)
+            markdown.required.set(true)
+        }
+    }
+
+    // The default `:detekt` task runs without type resolution, which silences rules like
+    // `UnnecessaryFullyQualifiedName`, `IgnoredReturnValue`, `UselessCallOnNotNull`, etc. Wire the
+    // type-resolving per-source-set tasks into the aggregate `detekt` task so `just lint` / CI pick
+    // them up without changing entry points.
+    tasks.matching { it.name == "detekt" }.configureEach {
+        dependsOn("detektMain", "detektTest")
     }
 }
 
-// Read more: https://plugins.jetbrains.com/docs/intellij/tools-intellij-platform-gradle-plugin.html
 dependencies {
-    testImplementation(libs.junit.jupiter)
-    testImplementation(libs.opentest4j)
-    testRuntimeOnly(libs.junit.platform.launcher)
-    testRuntimeOnly(libs.junit4)
-
-    detektPlugins(libs.detekt.rules.ktlint.wrapper)
-    detektPlugins(libs.detekt.compose.rules)
-
     intellijPlatform {
-        intellijIdea("2026.1")
+        intellijIdea(intellijPlatformVersion)
 
-        // Add plugin dependencies for compilation here:
-
-        composeUI()
-        bundledModule("intellij.platform.compose.markdown")
-        bundledModule("intellij.platform.jewel.markdown.core")
-        bundledModule("intellij.platform.jewel.markdown.ideLafBridgeStyling")
-        bundledModule("intellij.platform.jewel.markdown.extensions.autolink")
-        bundledModule("intellij.platform.jewel.markdown.extensions.gfmAlerts")
-        bundledModule("intellij.platform.jewel.markdown.extensions.gfmTables")
-        bundledModule("intellij.platform.jewel.markdown.extensions.gfmStrikethrough")
-        bundledPlugin("com.intellij.mcpServer")
-        bundledPlugin("Git4Idea")
-
+        pluginModule(implementation(project(":shared")))
+        pluginModule(implementation(project(":frontend")))
+        pluginModule(implementation(project(":backend")))
+        pluginModule(implementation(project(":backend-mcp")))
     }
 }
 
 intellijPlatform {
+    splitMode = true
+    pluginInstallationTarget = SplitModeAware.PluginInstallationTarget.BOTH
+
     pluginConfiguration {
         ideaVersion {
-            sinceBuild = "261"
+            sinceBuild = "262"
         }
 
         changeNotes = latestChangelog()
@@ -91,52 +136,8 @@ intellijPlatform {
     }
 }
 
-tasks {
-    test {
-        useJUnitPlatform()
-    }
-
-    // Set the JVM compatibility versions
-    withType<JavaCompile> {
-        sourceCompatibility = "21"
-        targetCompatibility = "21"
-    }
-}
-
-kotlin {
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
-    }
-}
-
-detekt {
-    source.setFrom("src/main/kotlin", "src/test/kotlin")
-    parallel = true
-    config.setFrom(files("$rootDir/detekt.yml"))
-    buildUponDefaultConfig = true
-    basePath.set(projectDir)
-    baseline = file("$rootDir/detekt-baseline.xml")
-}
-
-tasks.withType<Detekt>().configureEach {
-    jvmTarget.set("21")
-
-    reports {
-        sarif.required.set(true)
-        markdown.required.set(true)
-    }
-}
-
-tasks.withType<DetektCreateBaselineTask>().configureEach {
-    jvmTarget.set("21")
-    baseline.set(file("$rootDir/detekt-baseline.xml"))
-}
-
-// The default `:detekt` task runs without type resolution, which silences
-// rules like `UnnecessaryFullyQualifiedName`, `IgnoredReturnValue`,
-// `UselessCallOnNotNull`, etc. Wire the type-resolving per-source-set tasks
-// into the aggregate `:detekt` task so `just lint` / CI / pre-commit pick
-// them up automatically without changing entry points.
-tasks.named("detekt") {
-    dependsOn("detektMain", "detektTest")
+// `runIde` stays a classic monolithic IDE (frontend and backend modules in one JVM);
+// `runIdeSplitMode` / `runIdeBackend` / `runIdeFrontend` run the Host + JetBrains Client pair.
+tasks.named<RunIdeTask>("runIde") {
+    splitMode = false
 }

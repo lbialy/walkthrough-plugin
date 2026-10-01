@@ -47,8 +47,23 @@ Install **Walkthrough** from the
 [JetBrains Marketplace](https://plugins.jetbrains.com/plugin/31637-walkthrough/), or from the IDE:
 **Settings → Plugins → Marketplace**, search for *Walkthrough*, and click **Install**.
 
-Requires IntelliJ IDEA 2026.1 or newer. The plugin depends on JetBrains' **MCP Server** plugin,
+Requires IntelliJ IDEA 2026.2 or newer. The plugin depends on JetBrains' **MCP Server** plugin,
 which the IDE installs alongside Walkthrough automatically.
+
+#### Remote Development (JetBrains Gateway / Split Mode)
+
+Walkthrough also works when the IDE backend runs on a remote host (or in a sandbox / container)
+and you work through the JetBrains Client. Install the plugin on **both** sides: on the **Host**
+(the backend, where the MCP server and your agent run) and in the **JetBrains Client** (where the
+popups are drawn). Enable the MCP server on the Host and point your agent at the Host's loopback
+MCP URL, for example from inside the remote environment:
+
+```bash
+claude mcp add --transport http intellij http://127.0.0.1:64342/stream
+```
+
+File and diff walkthroughs render in the Client; Git revisions for diff walkthroughs are read on
+the Host.
 
 ### 2. Enable the MCP server
 
@@ -136,7 +151,8 @@ development tooling automatically.
 | Command | Description |
 | --- | --- |
 | `just build` | Build the plugin |
-| `just run` | Run in a sandboxed IDE instance |
+| `just run` | Run in a sandboxed IDE instance (monolithic) |
+| `just run-split` | Run a sandboxed IDE backend + JetBrains Client in Split Mode |
 | `just verify` | Verify plugin compatibility |
 | `just lint` | Run Detekt static analysis |
 | `just test` | Run unit tests |
@@ -148,5 +164,6 @@ Without `just`, use `./gradlew buildPlugin`, `./gradlew runIde`, etc. directly.
 
 ## Architecture
 
-The plugin targets IntelliJ IDEA 261+ and uses JetBrains Compose (via the Jewel library) for the
-walkthrough popup UI. See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
+The plugin targets IntelliJ IDEA 262+ and is split into frontend and backend content modules so it
+works both in a regular IDE and in Remote Development / Split Mode. The popup UI uses JetBrains
+Compose (via the Jewel library). See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.

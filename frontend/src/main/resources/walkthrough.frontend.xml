@@ -1,0 +1,35 @@
+<idea-plugin>
+    <dependencies>
+        <module name="intellij.platform.frontend"/>
+        <plugin id="com.intellij.modules.compose"/>
+        <module name="intellij.platform.compose.markdown"/>
+        <module name="walkthrough.shared"/>
+    </dependencies>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="com.forketyfork.walkthrough.WalkthroughSettings"/>
+        <applicationConfigurable
+                parentId="tools"
+                instance="com.forketyfork.walkthrough.WalkthroughSettingsConfigurable"
+                id="com.forketyfork.walkthrough.settings"
+                displayName="Walkthrough"/>
+        <diff.DiffExtension implementation="com.forketyfork.walkthrough.WalkthroughDiffExtension"/>
+        <postStartupActivity implementation="com.forketyfork.walkthrough.FrontendWalkthroughStartupActivity"/>
+    </extensions>
+
+    <actions>
+        <group id="com.forketyfork.walkthrough.Group" text="Walkthrough" popup="true">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action
+                id="com.forketyfork.walkthrough.ShowHistory"
+                class="com.forketyfork.walkthrough.WalkthroughHistoryAction"
+                text="Show Walkthrough History"
+                description="Show previous walkthroughs for the current project"/>
+            <action
+                id="com.forketyfork.walkthrough.ExportMarkdown"
+                class="com.forketyfork.walkthrough.WalkthroughExportAction"
+                text="Export Walkthrough to Markdown…"
+                description="Export a saved walkthrough as a shareable Markdown document"/>
+        </group>
+    </actions>
+</idea-plugin>

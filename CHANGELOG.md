@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Walkthroughs work in Remote Development / Split Mode (JetBrains Gateway): with the plugin
+  installed on both the Host and the JetBrains Client, file and diff walkthroughs, follow-up
+  questions, history replay and Markdown export all work while the agent talks to the Host's MCP
+  server.
+
+### Changed
+
+- The minimum supported IDE version is now IntelliJ IDEA 2026.2.
+
+### Fixed
+
+- Closing a diff tab that a diff walkthrough popup is attached to now closes the popup instead of
+  leaving it stuck over the editor and breaking repaints.
+
 ## [0.8.1] - 2026-09-14
 
 ### Added

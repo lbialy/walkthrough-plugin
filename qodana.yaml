@@ -34,5 +34,5 @@ exclude:
   # our Kotlin sources.
   - name: FunctionName
     paths:
-      - src/main/kotlin
-      - src/test/kotlin
+      - frontend/src/main/kotlin
+      - frontend/src/test/kotlin

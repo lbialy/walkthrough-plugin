@@ -1,0 +1,11 @@
+<idea-plugin>
+    <dependencies>
+        <plugin id="com.intellij.mcpServer"/>
+        <module name="walkthrough.backend"/>
+        <module name="walkthrough.shared"/>
+    </dependencies>
+
+    <extensions defaultExtensionNs="com.intellij.mcpServer">
+        <mcpToolset implementation="com.forketyfork.walkthrough.ShowWalkthroughItemsToolset"/>
+    </extensions>
+</idea-plugin>

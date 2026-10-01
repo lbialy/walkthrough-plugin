@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: .intellijPlatform
-          key: ${{ runner.os }}-intellij-platform-${{ hashFiles('build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
+          key: ${{ runner.os }}-intellij-platform-${{ hashFiles('build.gradle.kts', '*/build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-intellij-platform-
 
@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ~/.cache/pluginVerifier
-          key: ${{ runner.os }}-plugin-verifier-${{ hashFiles('build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
+          key: ${{ runner.os }}-plugin-verifier-${{ hashFiles('build.gradle.kts', '*/build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-plugin-verifier-
 
@@ -94,7 +94,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: .intellijPlatform
-          key: ${{ runner.os }}-intellij-platform-${{ hashFiles('build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
+          key: ${{ runner.os }}-intellij-platform-${{ hashFiles('build.gradle.kts', '*/build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-intellij-platform-
 

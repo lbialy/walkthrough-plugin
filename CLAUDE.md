@@ -8,7 +8,8 @@
 **Description:** IntelliJ IDEA plugin for presenting inline walkthrough guidance inside the editor.
 Shows styled popups near target lines with a connector anchored to the line, and lets the user
 step through a sequence of walkthrough items. Built with JetBrains Compose via the Jewel library.
-**Stack:** Kotlin 2.3.21, JetBrains Compose (Jewel), IntelliJ Platform Gradle Plugin v2, Detekt
+**Stack:** Kotlin 2.4.0, JetBrains Compose (Jewel), IntelliJ Platform Gradle Plugin v2 (split-mode
+modules), fleet RPC (`rpc` Gradle plugin), kotlinx-serialization, Detekt
 **Status:** Active development
 
 ## Build & Run
@@ -21,8 +22,11 @@ direnv allow          # or: nix develop
 # Build
 just build            # or: ./gradlew buildPlugin
 
-# Run in a sandboxed IDE instance
+# Run in a sandboxed IDE instance (monolithic: frontend + backend modules in one JVM)
 just run              # or: ./gradlew runIde
+
+# Run in Split Mode: sandboxed IDE backend + JetBrains Client connected to it
+just run-split        # or: ./gradlew runIdeSplitMode
 
 # Verify plugin compatibility
 just verify           # or: ./gradlew verifyPlugin
@@ -43,7 +47,10 @@ just publish          # or: ./gradlew publishPlugin
 just hooks
 ```
 
-The plugin is also tested by running it in the IDE via `runIde`.
+The plugin is also tested by running it in the IDE via `runIde` and in Split Mode via
+`runIdeSplitMode`. Split-mode run tasks don't accept `--args`; open the project from the JetBrains
+Client window. The sandbox backend needs the MCP server enabled in its own config
+(`.intellijPlatform/sandbox/.../config_runIdeBackend`).
 
 ## Infrastructure
 
@@ -55,50 +62,75 @@ The plugin is also tested by running it in the IDE via `runIde`.
 
 ## Architecture
 
-The plugin targets IntelliJ IDEA 261+ and uses **JetBrains Compose** (via the Jewel library) for
-the walkthrough content UI. Compose content is hosted through `JewelComposePanel`, while
-layered-pane integration such as popup hosting and connector painting lives in small Swing helper
-components.
+The plugin targets IntelliJ IDEA 262+ and is a Plugin Model v2 **split plugin**: one plugin zip,
+installed on both the Host (backend) and the JetBrains Client (frontend). The root
+`src/main/resources/META-INF/plugin.xml` only declares the plugin and its `<content>` modules; the
+platform loads each module where its dependencies are satisfied. In a monolithic IDE all four
+modules load in one JVM. Every module uses the package `com.forketyfork.walkthrough`; Kotlin
+`internal` does not cross Gradle modules, so anything shared is `public`.
+
+| Gradle module | Content module / descriptor | Loads where | Contents |
+| --- | --- | --- | --- |
+| `shared` | `walkthrough.shared` (required) | both | `WalkthroughItem`/`WalkthroughRecord` models, the `WalkthroughRpcApi` protocol + DTOs, pure helpers (labels, anchor fallback, Markdown export) |
+| `backend` | `walkthrough.backend` | Host | session state machine, history store, Git revision loading, RPC implementation |
+| `backend-mcp` | `walkthrough.backend.mcp` | Host with MCP Server enabled | `ShowWalkthroughItemsToolset` |
+| `frontend` | `walkthrough.frontend` | Client | Compose/Jewel popup, editor overlay, diff viewer, settings, Tools menu actions |
+
+MCP stays on the backend, pixels stay on the frontend, and they talk only through
+`WalkthroughRpcApi` (fleet RPC; in a monolithic IDE the call is local).
+
+### Protocol
+
+- `sessionState(projectId): Flow<WalkthroughUiStateDto>` — a StateFlow snapshot of the active
+  session (`null` = no popup), collected by the frontend in `durable {}`. Every change bumps
+  `revision`; the frontend reconciles idempotently on `sessionId` + `revision`, and honours a
+  `FocusRequestDto` once per `seq` (show → step 0, tangent insert → first inserted step).
+- `reportShown` — the frontend acknowledges the first display of a session (`Shown`/`NoEditor`);
+  the MCP tool waits for it (`SHOW_ACK_TIMEOUT_MILLIS`, 20 s) and otherwise fails with
+  "Walkthrough UI did not respond…".
+- `submitQuestion` (with the current step's `parentLabel`, which is frontend-owned), `dismiss`,
+  `listHistory`, `replayHistory`, `writeExport`, `loadDiffRevisions`, `resolveFiles`.
+- One-shot frontend calls go through `callBackend` (`durable` + 15 s timeout).
+
+**Gotcha — `VirtualFileId`:** `rpcId()` binds the file to the client session of the *current RPC
+call*. Minting ids inside an MCP tool call binds them to the Host's local session and
+`virtualFile()` returns `null` on the JetBrains Client (it only works in a monolithic IDE because
+the id carries the local file). So the backend only validates paths (`ResolvedItemDto.lineCount`)
+and the frontend fetches ids itself via `resolveFiles`.
+
+**Diffs are built on the frontend.** 262 has no public frontend diff extension, and a diff opened
+by the backend is rendered on the backend. The backend returns revision texts
+(`DiffRevisionLoader`, Git4Idea); the frontend builds a `SimpleDiffRequest`, calls
+`DiffManager.showDiff`, and `WalkthroughDiffExtension` attaches the popup. Closing the diff tab
+closes the popup (the viewer-disposal hook must be registered under the viewer only — a
+`Disposable` has a single parent and `Disposer.register` re-parents).
 
 ### Key classes
 
-- **`WalkthroughItem.kt`** — The `WalkthroughItem` data class and `WalkthroughPopupLayout` layout
-  constants.
-
-- **`WalkthroughPopupContent.kt` / `WalkthroughPopupWidgets.kt`** — The Jewel Compose popup
-  content, markdown body, navigation controls, source navigation button, and follow-up question
-  input.
-
-- **`WalkthroughOrchestrator.kt`** — The entry point: `showWalkthroughItems(project, editor, items)`
-  creates and positions the walkthrough UI via `WalkthroughPopupSurface`, hosted on the editor
-  layered pane above the current caret line. Used by the MCP toolset and history replay action.
-
-- **`WalkthroughPopupSurface.kt`** — The Swing host that owns the popup surface inside the editor
-  layered pane, renders the connector on the same surface as the popup content, and keeps the UI
-  aligned with editor scrolling and resizing.
-
-- **`WalkthroughSessionRegistry.kt`** — Tracks the active walkthrough session, stable step labels,
-  dismissed sessions, follow-up questions, loading state, and inserted child steps.
-
-- **`WalkthroughHistoryService.kt` / `WalkthroughHistoryStore.kt`** — Store and load per-project
-  walkthrough history from `.idea/walkthroughs/`.
-
-- **`WalkthroughSettings.kt` / `WalkthroughSettingsConfigurable.kt` / `WalkthroughPalette.kt`** —
-  Persist and expose the user-selectable popup color palettes.
-
-- **`ShowWalkthroughItemsToolset`** — An MCP toolset (`McpToolset`) exposing
-  `show_walkthrough_items`, `await_walkthrough_question`, and `insert_walkthrough_tangents` to MCP
-  clients. Gets the active project from the coroutine context via `projectOrNull`, dispatches UI
-  changes to the EDT via `withContext(Dispatchers.EDT)`, and calls the same walkthrough session
-  code used by local actions.
+- **Backend:** `WalkthroughBackendSession` (question waiter machine, grace period, tangent
+  labels), `WalkthroughBackendSessionRegistry` (project service; one active session, dismissed-id
+  ring buffer, state flow, pending show acks), `WalkthroughSessionPublisher` (resolve → start →
+  await ack), `WalkthroughHistoryService`/`WalkthroughHistoryStore` (`.idea/walkthroughs/`, Gson),
+  `DiffRevisionLoader`, `BackendWalkthroughRpcApi`.
+- **Backend MCP:** `ShowWalkthroughItemsToolset` — `show_walkthrough_items`,
+  `show_diff_walkthrough_items`, `await_walkthrough_question`, `insert_walkthrough_tangents`. Tool
+  names, parameters and reply strings are part of the companion skill's contract; keep them stable.
+- **Frontend:** `FrontendWalkthroughHost` (project service started by a `postStartupActivity`;
+  collects the state and owns the popup), `WalkthroughUiSession` (Compose state + current step),
+  `WalkthroughOrchestrator.kt` / `ResolvedWalkthroughTarget.kt` (file popups),
+  `DiffWalkthroughSession.kt` (diff popups), `WalkthroughPopupSurface.kt` (layered-pane host and
+  connector), `WalkthroughPopupContent.kt` / `WalkthroughPopupWidgets.kt` (Compose UI),
+  `WalkthroughSettings*.kt` / `WalkthroughPalette.kt` (frontend-local settings),
+  `WalkthroughHistoryAction` / `WalkthroughExportAction`.
 
 ### MCP server integration
 
-The plugin depends on the bundled `com.intellij.mcpServer` plugin. Toolsets are registered in
-`plugin.xml` under `defaultExtensionNs="com.intellij.mcpServer"` with the `<mcpToolset>` extension
-point. Tool methods are discovered by reflection: annotate a suspend method with `@McpTool` and
-`@McpDescription`; annotate each parameter with `@McpDescription`. Use `mcpFail(message)` to
-return an error response.
+`backend-mcp` depends on the bundled `com.intellij.mcpServer` plugin. Toolsets are registered in
+`walkthrough.backend.mcp.xml` under `defaultExtensionNs="com.intellij.mcpServer"` with the
+`<mcpToolset>` extension point. Tool methods are discovered by reflection: annotate a suspend
+method with `@McpTool` and `@McpDescription`; annotate each parameter with `@McpDescription`. Use
+`mcpFail(message)` to return an error response. Get the active project via
+`currentCoroutineContext().projectOrNull` (import `com.intellij.mcpserver.projectOrNull`).
 
 Current MCP flow:
 
@@ -109,19 +141,20 @@ Current MCP flow:
 3. `insert_walkthrough_tangents(walkthroughId, parentLabel, items)` inserts generated answer steps
    as labeled children and moves the popup to the first inserted step.
 
-Key API notes:
+### Build notes
 
-- Get the active project via `currentCoroutineContext().projectOrNull` (import
-  `com.intellij.mcpserver.projectOrNull`) — `getProjectOrNull` is the Java getter name; the
-  Kotlin property is `projectOrNull`.
-- Dispatch to the EDT via `withContext(Dispatchers.EDT)` — `EDT` (imported from
-  `com.intellij.openapi.application`) is an extension property on `Dispatchers`, not a standalone
-  value.
-
-### IntelliJ platform dependency
-
-`build.gradle.kts` resolves IntelliJ IDEA `2026.1` through the IntelliJ Platform Gradle Plugin,
-so the project does not depend on a machine-specific local IDE path.
+- `build.gradle.kts` resolves IntelliJ IDEA `intellijPlatformVersion` (`gradle.properties`) through
+  the IntelliJ Platform Gradle Plugin; the root project assembles the four modules with
+  `pluginModule(...)`, `splitMode = true` and `PluginInstallationTarget.BOTH`. `runIde` is pinned to
+  `splitMode = false`.
+- Plugin versions in `settings.gradle.kts` `pluginManagement` are literals (Gradle cannot read the
+  version catalog there). Kotlin, the Compose compiler plugin and the serialization plugin must
+  match the Kotlin version the `rpc` plugin is built for (`2.4.0-RC-0.1` → Kotlin 2.4.0).
+- The platform loads content module `walkthrough.x` from `lib/modules/walkthrough.x.jar`, so each
+  module's `composedJar` is renamed accordingly (`backend-mcp` → `walkthrough.backend.mcp`).
+- `intellij.platform.ide.rpc` (home of `VirtualFileId`) is part of the core platform jar; don't
+  declare it as a `bundledModule` or descriptor dependency.
+- Detekt and JUnit 5 are configured for all modules in the root `subprojects {}` block.
 
 ## Agent Rules
 

@@ -1,0 +1,453 @@
+package com.forketyfork.walkthrough
+
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.event.VisibleAreaEvent
+import com.intellij.openapi.editor.event.VisibleAreaListener
+import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.wm.IdeGlassPane
+import java.awt.BasicStroke
+import java.awt.Dimension
+import java.awt.Graphics
+import java.awt.Graphics2D
+import java.awt.Point
+import java.awt.RenderingHints
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
+import java.awt.event.KeyEvent
+import java.awt.geom.Path2D
+import java.awt.geom.Point2D
+import java.awt.geom.Rectangle2D
+import javax.swing.JComponent
+import javax.swing.JLayeredPane
+import javax.swing.KeyStroke
+import javax.swing.SwingUtilities
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sign
+import kotlin.math.sin
+
+internal object WalkthroughConnectorStyle {
+    const val BORDER_INSET = 20f
+    const val START_PULL_FACTOR = 0.32f
+    const val START_PULL_MINIMUM = 72f
+    const val VERTICAL_PULL_FACTOR = 0.28f
+    const val VERTICAL_PULL_MINIMUM = 54f
+    const val END_PULL_FACTOR = 0.24f
+    const val END_HORIZONTAL_PULL_MINIMUM = 48f
+    const val END_VERTICAL_PULL_MINIMUM = 42f
+    const val END_CURVE_FACTOR = 0.12f
+    const val BRACE_GAP = 8f
+    const val BRACE_WIDTH = 12f
+    const val BRACE_VIEWPORT_INSET = 12f
+    const val DEFAULT_SIGN = 1f
+    const val ARROW_SPREAD_DEGREES = 24.0
+    const val ARROW_HEAD_LENGTH = 13.0
+    const val STROKE_WIDTH = 2.45f
+}
+
+private data class ConnectorPaintContext(
+    val editor: Editor,
+    val item: WalkthroughItem,
+    val popupBounds: Rectangle2D.Float,
+    val popupScreenBounds: Rectangle2D.Float,
+)
+
+internal class WalkthroughPopupSurface(
+    val content: JComponent,
+    private var palette: WalkthroughPalette,
+    private val onCloseRequested: () -> Unit,
+    private val onInteractionEnd: () -> Unit = {},
+) : JComponent(),
+    VisibleAreaListener,
+    Disposable {
+    private var editor: Editor? = null
+
+    /**
+     * The anchor editor, or `null` once it has been disposed (e.g. its diff tab was closed). Painting
+     * against a disposed editor throws, which aborts painting of the whole layered pane.
+     */
+    private val liveEditor: Editor?
+        get() = editor?.takeUnless { it.isDisposed }
+    private var item: WalkthroughItem? = null
+    private var layeredPane: JLayeredPane? = null
+    private var interactionGlassPane: IdeGlassPane? = null
+    private var interactionHandlerDisposable: Disposable? = null
+    var connectorHidden: Boolean = false
+        set(value) {
+            field = value
+            repaint()
+        }
+    private val layeredPaneResizeListener = object : ComponentAdapter() {
+        override fun componentResized(event: ComponentEvent) {
+            refreshBounds()
+            liveEditor?.let(::moveToFitScreen)
+            repaint()
+        }
+    }
+
+    init {
+        isOpaque = false
+        layout = null
+        add(content)
+        content.isVisible = false
+        content.setBounds(0, 0, 0, 0)
+        content.registerKeyboardAction(
+            { cancel() },
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0),
+            WHEN_ANCESTOR_OF_FOCUSED_COMPONENT,
+        )
+    }
+
+    override fun contains(x: Int, y: Int): Boolean = content.isVisible && content.bounds.contains(x, y)
+
+    fun update(editor: Editor, item: WalkthroughItem) {
+        if (this.editor !== editor) {
+            this.editor?.scrollingModel?.removeVisibleAreaListener(this)
+            this.editor = editor
+            editor.scrollingModel.addVisibleAreaListener(this)
+        }
+        this.item = item
+        val targetLayeredPane = SwingUtilities.getRootPane(editor.contentComponent)?.layeredPane
+        if (layeredPane !== targetLayeredPane) {
+            detachFromLayeredPane()
+            layeredPane = targetLayeredPane?.also { pane ->
+                pane.addComponentListener(layeredPaneResizeListener)
+                pane.setLayer(this, JLayeredPane.POPUP_LAYER)
+                pane.add(this)
+            }
+        }
+        refreshInteractionHandler(editor)
+        refreshBounds()
+        repaint()
+    }
+
+    private fun refreshInteractionHandler(editor: Editor) {
+        val targetGlassPane = findGlassPane(editor)
+        if (targetGlassPane === interactionGlassPane) {
+            return
+        }
+        interactionHandlerDisposable?.let(Disposer::dispose)
+        interactionHandlerDisposable = null
+        interactionGlassPane = targetGlassPane
+        if (targetGlassPane == null) {
+            return
+        }
+        val handlerDisposable = Disposer.newDisposable("WalkthroughPopupInteraction")
+        Disposer.register(this, handlerDisposable)
+        installPopupInteractionHandler(
+            glassPane = targetGlassPane,
+            parentDisposable = handlerDisposable,
+            popupProvider = { this },
+            editorProvider = { liveEditor },
+            onInteractionEnd = onInteractionEnd,
+        )
+        interactionHandlerDisposable = handlerDisposable
+    }
+
+    fun updatePalette(palette: WalkthroughPalette) {
+        this.palette = palette
+        repaint()
+    }
+
+    override fun dispose() {
+        editor?.scrollingModel?.removeVisibleAreaListener(this)
+        editor = null
+        item = null
+        detachFromLayeredPane()
+    }
+
+    override fun visibleAreaChanged(event: VisibleAreaEvent) {
+        if (event.oldRectangle == event.newRectangle) {
+            return
+        }
+        refreshBounds()
+        repaint()
+    }
+
+    override fun paintComponent(graphics: Graphics) {
+        super.paintComponent(graphics)
+        if (connectorHidden) return
+        val context = currentPaintContext() ?: return
+        val targetGeometry = calculateWalkthroughTargetScreenGeometry(
+            editor = context.editor,
+            item = context.item,
+            popupBounds = context.popupScreenBounds,
+        )
+        val arrowTarget = targetGeometry.arrowPoint.toComponentCoordinates(this)
+        val connector = buildConnector(
+            nearestBorderAnchor(context.popupBounds, arrowTarget),
+            arrowTarget,
+        )
+
+        val graphics2D = graphics.create() as Graphics2D
+        try {
+            graphics2D.setRenderingHint(
+                RenderingHints.KEY_ANTIALIASING,
+                RenderingHints.VALUE_ANTIALIAS_ON,
+            )
+            graphics2D.color = palette.connectorStrokeColor
+            graphics2D.stroke = BasicStroke(
+                WalkthroughConnectorStyle.STROKE_WIDTH,
+                BasicStroke.CAP_ROUND,
+                BasicStroke.JOIN_ROUND,
+            )
+            targetGeometry.brace
+                ?.toComponentCoordinates(this)
+                ?.let { graphics2D.draw(buildCurlyBracePath(it)) }
+            graphics2D.draw(connector.path)
+            drawArrowHead(graphics2D, connector.end, connector.endControl, palette)
+        } finally {
+            graphics2D.dispose()
+        }
+    }
+
+    fun refreshBounds() {
+        val pane = layeredPane ?: return
+        setBounds(0, 0, pane.width, pane.height)
+        if (parent !== pane) {
+            pane.setLayer(this, JLayeredPane.POPUP_LAYER)
+            pane.add(this)
+        }
+    }
+
+    fun cancel() {
+        onCloseRequested()
+    }
+
+    private fun currentPaintContext(): ConnectorPaintContext? {
+        val currentEditor = liveEditor
+        val currentItem = item
+        val popupBounds = content.bounds.takeIf { bounds ->
+            content.isVisible && bounds.width > 0 && bounds.height > 0
+        }
+        return if (currentEditor != null && currentItem != null && popupBounds != null) {
+            val popupScreenOrigin = Point(0, 0).also {
+                SwingUtilities.convertPointToScreen(it, content)
+            }
+            ConnectorPaintContext(
+                editor = currentEditor,
+                item = currentItem,
+                popupBounds = Rectangle2D.Float(
+                    popupBounds.x.toFloat(),
+                    popupBounds.y.toFloat(),
+                    popupBounds.width.toFloat(),
+                    popupBounds.height.toFloat(),
+                ),
+                popupScreenBounds = Rectangle2D.Float(
+                    popupScreenOrigin.x.toFloat(),
+                    popupScreenOrigin.y.toFloat(),
+                    popupBounds.width.toFloat(),
+                    popupBounds.height.toFloat(),
+                ),
+            )
+        } else {
+            null
+        }
+    }
+
+    private fun detachFromLayeredPane() {
+        layeredPane?.let { pane ->
+            pane.removeComponentListener(layeredPaneResizeListener)
+            pane.remove(this)
+            pane.repaint()
+        }
+        layeredPane = null
+    }
+}
+
+internal fun WalkthroughPopupSurface.show(editor: Editor, screenPoint: Point) {
+    content.isVisible = true
+    setPopupScreenLocation(screenPoint)
+    moveToFitScreen(editor)
+    content.requestFocusInWindow()
+    repaint()
+}
+
+internal fun WalkthroughPopupSurface.popupLocationOnScreen(): Point? = if (content.isShowing) {
+    Point(0, 0).also { SwingUtilities.convertPointToScreen(it, content) }
+} else {
+    null
+}
+
+internal fun WalkthroughPopupSurface.setPopupScreenLocation(screenPoint: Point) {
+    val localPoint = Point(screenPoint)
+    SwingUtilities.convertPointFromScreen(localPoint, this)
+    content.setBounds(localPoint.x, localPoint.y, content.width, content.height)
+    repaint()
+}
+
+internal fun WalkthroughPopupSurface.moveToFitScreen(editor: Editor) {
+    val currentLocation = popupLocationOnScreen() ?: return
+    val popupSize = resolvePopupSize(this) ?: return
+    val constrainedLocation = constrainPopupScreenLocation(editor, currentLocation, popupSize)
+    if (constrainedLocation != currentLocation) {
+        setPopupScreenLocation(constrainedLocation)
+    }
+}
+
+internal var WalkthroughPopupSurface.popupSize: Dimension
+    get() = resolvePopupSize(this) ?: WalkthroughPopupLayout.fallbackSize
+    set(value) {
+        content.preferredSize = value
+        content.setBounds(content.x, content.y, value.width, value.height)
+        content.revalidate()
+        repaint()
+    }
+
+private enum class ConnectorSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+private data class ConnectorAnchor(val point: Point2D.Float, val side: ConnectorSide)
+
+private data class ConnectorPath(val path: Path2D.Float, val end: Point2D.Float, val endControl: Point2D.Float)
+
+internal fun buildCurlyBracePath(brace: CurlyBraceGeometry): Path2D.Float {
+    val centerY = (brace.topY + brace.bottomY) / 2f
+    val centerPull = ((brace.bottomY - brace.topY) / 2f * 0.62f).coerceAtLeast(4f)
+    val outerX = if (brace.opensRight) brace.leftX + brace.width else brace.leftX
+    val edgeX = if (brace.opensRight) brace.leftX else brace.leftX + brace.width
+    return Path2D.Float().apply {
+        moveTo(edgeX.toDouble(), brace.topY.toDouble())
+        curveTo(
+            outerX.toDouble(),
+            brace.topY.toDouble(),
+            outerX.toDouble(),
+            (centerY - centerPull).toDouble(),
+            outerX.toDouble(),
+            centerY.toDouble(),
+        )
+        curveTo(
+            outerX.toDouble(),
+            (centerY + centerPull).toDouble(),
+            outerX.toDouble(),
+            brace.bottomY.toDouble(),
+            edgeX.toDouble(),
+            brace.bottomY.toDouble(),
+        )
+    }
+}
+
+private fun nearestBorderAnchor(popupRect: Rectangle2D.Float, target: Point2D.Float): ConnectorAnchor {
+    val inset = WalkthroughConnectorStyle.BORDER_INSET
+    val minY = popupRect.y + inset
+    val maxY = (popupRect.y + popupRect.height - inset).coerceAtLeast(minY)
+    val minX = popupRect.x + inset
+    val maxX = (popupRect.x + popupRect.width - inset).coerceAtLeast(minX)
+    val candidates = listOf(
+        ConnectorAnchor(
+            Point2D.Float(popupRect.x, target.y.coerceIn(minY, maxY)),
+            ConnectorSide.Left,
+        ),
+        ConnectorAnchor(
+            Point2D.Float(popupRect.x + popupRect.width, target.y.coerceIn(minY, maxY)),
+            ConnectorSide.Right,
+        ),
+        ConnectorAnchor(
+            Point2D.Float(target.x.coerceIn(minX, maxX), popupRect.y),
+            ConnectorSide.Top,
+        ),
+        ConnectorAnchor(
+            Point2D.Float(target.x.coerceIn(minX, maxX), popupRect.y + popupRect.height),
+            ConnectorSide.Bottom,
+        ),
+    )
+    return candidates.minBy { anchor ->
+        val dx = anchor.point.x - target.x
+        val dy = anchor.point.y - target.y
+        dx * dx + dy * dy
+    }
+}
+
+private fun buildConnector(anchor: ConnectorAnchor, end: Point2D.Float): ConnectorPath {
+    val dx = end.x - anchor.point.x
+    val dy = end.y - anchor.point.y
+    val startPull = (abs(dx) * WalkthroughConnectorStyle.START_PULL_FACTOR)
+        .coerceAtLeast(WalkthroughConnectorStyle.START_PULL_MINIMUM)
+    val verticalPull = (abs(dy) * WalkthroughConnectorStyle.VERTICAL_PULL_FACTOR)
+        .coerceAtLeast(WalkthroughConnectorStyle.VERTICAL_PULL_MINIMUM)
+    val startControl = when (anchor.side) {
+        ConnectorSide.Left -> Point2D.Float(anchor.point.x - startPull, anchor.point.y)
+        ConnectorSide.Right -> Point2D.Float(anchor.point.x + startPull, anchor.point.y)
+        ConnectorSide.Top -> Point2D.Float(anchor.point.x, anchor.point.y - verticalPull)
+        ConnectorSide.Bottom -> Point2D.Float(anchor.point.x, anchor.point.y + verticalPull)
+    }
+    val nonZeroDxSign = dx.sign.takeIf { it != 0f } ?: WalkthroughConnectorStyle.DEFAULT_SIGN
+    val nonZeroDySign = dy.sign.takeIf { it != 0f } ?: WalkthroughConnectorStyle.DEFAULT_SIGN
+    val endControl = if (abs(dx) >= abs(dy)) {
+        Point2D.Float(
+            end.x - nonZeroDxSign * (abs(dx) * WalkthroughConnectorStyle.END_PULL_FACTOR)
+                .coerceAtLeast(WalkthroughConnectorStyle.END_HORIZONTAL_PULL_MINIMUM),
+            end.y - dy * WalkthroughConnectorStyle.END_CURVE_FACTOR,
+        )
+    } else {
+        Point2D.Float(
+            end.x - dx * WalkthroughConnectorStyle.END_CURVE_FACTOR,
+            end.y - nonZeroDySign * (abs(dy) * WalkthroughConnectorStyle.END_PULL_FACTOR)
+                .coerceAtLeast(WalkthroughConnectorStyle.END_VERTICAL_PULL_MINIMUM),
+        )
+    }
+    val path = Path2D.Float().apply {
+        moveTo(anchor.point.x.toDouble(), anchor.point.y.toDouble())
+        val lineEnd = connectorLineEnd(end, endControl)
+        curveTo(
+            startControl.x.toDouble(),
+            startControl.y.toDouble(),
+            endControl.x.toDouble(),
+            endControl.y.toDouble(),
+            lineEnd.x.toDouble(),
+            lineEnd.y.toDouble(),
+        )
+    }
+    return ConnectorPath(path, end, endControl)
+}
+
+internal fun connectorLineEnd(end: Point2D.Float, endControl: Point2D.Float): Point2D.Float {
+    val angle = atan2((end.y - endControl.y).toDouble(), (end.x - endControl.x).toDouble())
+    return Point2D.Float(
+        end.x - (WalkthroughConnectorStyle.ARROW_HEAD_LENGTH * cos(angle)).toFloat(),
+        end.y - (WalkthroughConnectorStyle.ARROW_HEAD_LENGTH * sin(angle)).toFloat(),
+    )
+}
+
+private fun Point2D.Float.toComponentCoordinates(component: JComponent): Point2D.Float {
+    val componentOrigin = Point(0, 0).also { SwingUtilities.convertPointToScreen(it, component) }
+    return Point2D.Float(x - componentOrigin.x, y - componentOrigin.y)
+}
+
+private fun CurlyBraceGeometry.toComponentCoordinates(component: JComponent): CurlyBraceGeometry {
+    val componentOrigin = Point(0, 0).also { SwingUtilities.convertPointToScreen(it, component) }
+    return copy(
+        leftX = leftX - componentOrigin.x,
+        topY = topY - componentOrigin.y,
+        bottomY = bottomY - componentOrigin.y,
+    )
+}
+
+private fun drawArrowHead(
+    graphics: Graphics2D,
+    end: Point2D.Float,
+    endControl: Point2D.Float,
+    palette: WalkthroughPalette,
+) {
+    val angle = atan2((end.y - endControl.y).toDouble(), (end.x - endControl.x).toDouble())
+    val spread = Math.toRadians(WalkthroughConnectorStyle.ARROW_SPREAD_DEGREES)
+    val headLength = WalkthroughConnectorStyle.ARROW_HEAD_LENGTH
+    val leftX = end.x - (headLength * cos(angle - spread)).toFloat()
+    val leftY = end.y - (headLength * sin(angle - spread)).toFloat()
+    val rightX = end.x - (headLength * cos(angle + spread)).toFloat()
+    val rightY = end.y - (headLength * sin(angle + spread)).toFloat()
+    val arrow = Path2D.Float().apply {
+        moveTo(end.x.toDouble(), end.y.toDouble())
+        lineTo(leftX.toDouble(), leftY.toDouble())
+        lineTo(rightX.toDouble(), rightY.toDouble())
+        closePath()
+    }
+    graphics.color = palette.connectorArrowFillColor
+    graphics.fill(arrow)
+}
